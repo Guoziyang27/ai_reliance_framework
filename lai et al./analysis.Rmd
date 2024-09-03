@@ -1,0 +1,421 @@
+---
+title: "analysis for lai et al."
+output:
+  pdf_document: default
+  html_document: default
+date: "2023-12-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(plyr)
+library(RJSONIO)
+library(brms)
+library(dplyr)
+library(ggplot2)
+library(ggdist)
+library(cowplot)
+library(tm)
+```
+
+In this document, we run the reliance framework analysis for deception detection task and its corresponding explanations in Lai et al. We estimate the behavioral agents' joint behavioral $\pi(\theta, v, a^b)$ by the empirical distribution in the experiment data. We first show the results using approximation of rational benchmark and the mis-reliant rational benchmark with overfitting to the empirical distribution and then show the results using approximation with the discretized signals.
+
+```{r read data}
+con <- file('./label.json', "r")
+raw_data <- ldply(fromJSON(con), data.frame)
+raw_data = raw_data %>% group_by(review_text) %>% mutate(review_id = cur_group_id())
+human_predictions = raw_data %>% filter(experiment == "control" | experiment == "highlight" | 
+                                          experiment == "heatmap" | experiment == "examples")
+exp_data = raw_data %>% filter(experiment != "control" & experiment != "highlight" &
+                                          experiment != "heatmap" & experiment != "examples")
+human_predictions = human_predictions %>% 
+  select(-predicted_label) %>% 
+  left_join(exp_data %>% 
+              select(predicted_label, review_text) %>% 
+              distinct(), by = c("review_text")) %>% 
+  mutate(predicted_label = as.numeric(predicted_label))
+```
+
+```{r scoring rule}
+scoring_rule = function(action, state) {
+  (action == state)
+}
+```
+
+```{r nlp and kmeans}
+task_data = raw_data %>% group_by(review_text) %>% summarise(review_id = cur_group_id())
+corpus = tm::Corpus(tm::VectorSource(task_data$review_text)) 
+corpus.cleaned <- tm::tm_map(corpus, tm::removeWords, tm::stopwords('english')) # Removing stop-words 
+corpus.cleaned <- tm::tm_map(corpus, tm::stemDocument, language = "english") # Stemming the words  
+corpus.cleaned <- tm::tm_map(corpus.cleaned, tm::stripWhitespace) # Trimming excessive whitespaces
+tdm <- tm::DocumentTermMatrix(corpus.cleaned) 
+tdm.tfidf <- tm::weightTfIdf(tdm)
+tdm.tfidf <- tm::removeSparseTerms(tdm.tfidf, 0.99) 
+tfidf.matrix <- as.matrix(tdm.tfidf) 
+```
+
+```{r cross validation to choose best K in kmeans}
+predict.kmeans <- function(object, newdata){
+  centers <- object$centers
+  n_centers <- nrow(centers)
+  dist_mat <- as.matrix(dist(rbind(centers, newdata)))
+  dist_mat <- dist_mat[-seq(n_centers), seq(n_centers)]
+  list(cluster = max.col(-dist_mat), total_error = sum(apply(dist_mat, 1, function(x) min(x))))
+}
+
+number_of_partition = 10
+partition_size = nrow(tfidf.matrix) / number_of_partition
+best.K = -1
+best.benchmark = c()
+best.test_sd = Inf
+for (K in seq(10, 200, 10)) {
+  benchmark = c()
+  for (i in seq(1, nrow(tfidf.matrix), partition_size)) {
+    test_set = tfidf.matrix[i:min(i + partition_size - 1, nrow(tfidf.matrix)),]
+    training_set = tfidf.matrix[-(i:min(i + partition_size - 1, nrow(tfidf.matrix))),]
+    clustering.kmeans <- kmeans(training_set, K)
+    cluster_number = predict(clustering.kmeans, test_set)$cluster
+    test_questionId = task_data$review_id[i:min(i + partition_size - 1, nrow(tfidf.matrix))]
+    
+    test_task_data = task_data %>% filter(review_id %in% test_questionId) %>% mutate(cluster = cluster_number)
+    test_human_predictions = human_predictions %>% 
+      filter(review_id %in% test_questionId) %>%
+      left_join(test_task_data %>% select(review_id, cluster), by = c("review_id"))
+    
+    train_task_data = task_data %>% filter(!(review_id %in% test_questionId)) %>% mutate(cluster = clustering.kmeans$cluster)
+    train_human_predictions = human_predictions %>% 
+      filter(!(review_id %in% test_questionId)) %>%
+      left_join(train_task_data %>% select(review_id, cluster), by = c("review_id"))
+    
+    test_rational_action = train_human_predictions %>%
+      rbind(test_human_predictions) %>%
+      group_by(user_label, predicted_label, cluster) %>%
+      mutate(pos_human_payoff = scoring_rule(user_label, actual_label),
+             pos_ai_payoff = scoring_rule(predicted_label, actual_label)) %>%
+      summarise(pos_human_payoff = mean(pos_human_payoff),
+                pos_ai_payoff = mean(pos_ai_payoff))
+    benchmark = c(benchmark, (test_human_predictions %>%
+      ungroup() %>%
+      left_join(test_rational_action, by = c("user_label", "predicted_label", "cluster")) %>%
+      mutate(benchmark_action = ifelse(pos_human_payoff > pos_ai_payoff, user_label, predicted_label)) %>%
+      mutate(benchmark = scoring_rule(benchmark_action, actual_label)) %>%
+      summarise(benchmark = mean(benchmark)))$benchmark)
+  }
+  if (best.test_sd > sd(benchmark)) {
+    best.test_sd = sd(benchmark)
+    best.benchmark = benchmark
+    best.K = K
+  }
+}
+best.K
+```
+
+```{r}
+clustering.kmeans <- kmeans(tfidf.matrix, best.K) 
+task_data = task_data %>% mutate(cluster = clustering.kmeans$cluster)
+```
+
+```{r separate data}
+raw_data = raw_data %>% left_join(task_data, by = c("review_text", "review_id"))
+human_predictions = raw_data %>% filter(experiment == "control" | experiment == "highlight" | 
+                                          experiment == "heatmap" | experiment == "examples")
+exp_data = raw_data %>% filter(experiment != "control" & experiment != "highlight" &
+                                          experiment != "heatmap" & experiment != "examples")
+human_predictions = human_predictions %>% 
+  select(-predicted_label) %>% 
+  left_join(exp_data %>% 
+              select(predicted_label, review_text) %>% 
+              distinct(), by = c("review_text")) %>% 
+  mutate(predicted_label = as.numeric(predicted_label))
+exp_data = exp_data %>%
+  left_join(human_predictions %>% 
+              select(human_pred = user_label, review_text), 
+            by = c("review_text")) %>% 
+  mutate(predicted_label = as.numeric(predicted_label))
+```
+
+## Approximating by overfitting to the empirical distribution
+
+```{r rational}
+rational_action = human_predictions %>% 
+  group_by(user_label, predicted_label, review_text) %>%
+  mutate(pos_human_payoff = scoring_rule(user_label, actual_label),
+         pos_ai_payoff = scoring_rule(predicted_label, actual_label)) %>%
+  summarise(pos_human_payoff = mean(pos_human_payoff),
+            pos_ai_payoff = mean(pos_ai_payoff))
+rational_data = human_predictions %>% 
+  ungroup() %>%
+  mutate(prior_human_payoff = mean(scoring_rule(user_label, actual_label)),
+         prior_ai_payoff = mean(scoring_rule(predicted_label, actual_label))) %>%
+  mutate(baseline_action = ifelse(prior_human_payoff > prior_ai_payoff, user_label, predicted_label)) %>%
+  mutate(baseline = scoring_rule(baseline_action, actual_label)) %>%
+  mutate(baseline2_action = ifelse(prior_human_payoff <= prior_ai_payoff, user_label, predicted_label)) %>%
+  mutate(baseline2 = scoring_rule(baseline2_action, actual_label)) %>%
+  left_join(rational_action) %>%
+  mutate(benchmark_action = ifelse(pos_human_payoff > pos_ai_payoff, user_label, predicted_label)) %>%
+  mutate(benchmark = scoring_rule(benchmark_action, actual_label)) %>%
+  mutate(rational_reliance_level = (benchmark_action == predicted_label) & (user_label != predicted_label))
+rational_data
+```
+
+```{r bootstrap rational}
+sample_size = 40
+n_round = 1000
+rational_results = data.frame()
+for (i in 1:n_round) {
+  rational_results = rational_data %>% 
+    group_by(review_num) %>%
+    sample_n(sample_size) %>%
+    ungroup() %>%
+    summarise(baseline = mean(baseline), 
+              baseline2 = mean(baseline2), 
+              benchmark = mean(benchmark),
+              rational_reliance = mean(rational_reliance_level)) %>%
+    rbind(rational_results)
+}
+rational_results = rational_results %>%
+  cross_join(exp_data %>% group_by(experiment) %>% summarise())
+rational_results
+```
+
+
+```{r behavioral}
+behavioral_data = exp_data %>%
+  mutate(behavioral = scoring_rule(user_label, actual_label))
+```
+
+```{r bootstrap}
+sample_size = 40
+n_round = 1000
+behavioral_results = data.frame()
+for (i in 1:n_round) {
+  behavioral_result = behavioral_data %>% 
+    group_by(review_num, experiment) %>%
+    sample_n(sample_size) %>%
+    group_by(experiment) %>%
+    summarise(behavioral = mean(behavioral))
+  reliance_level = behavioral_data %>% 
+    group_by(review_num, experiment) %>%
+    sample_n(sample_size) %>%
+    mutate(sample_id = row_number()) %>%
+    group_by(experiment, sample_id) %>%
+    summarise(reliance_level = mean((user_label == predicted_label) & (human_pred != user_label))) %>%
+    group_by(experiment) %>%
+    summarise(reliance_level = mean(reliance_level))
+  misreliant = rational_data %>% 
+    group_by(review_num) %>%
+    sample_n(sample_size) %>%
+    mutate(sample_id = row_number()) %>%
+    select(-experiment) %>%
+    cross_join(reliance_level) %>%
+    group_by(sample_id, experiment) %>%
+    arrange(desc(pos_ai_payoff - pos_human_payoff), .by_group = TRUE) %>%
+    mutate(sort_id = row_number()) %>%
+    mutate(max_sort_id = max(sort_id)) %>%
+    mutate(misreliant_action = ifelse(sort_id <= reliance_level * max_sort_id,
+                                      predicted_label, 
+                                      user_label)) %>%
+    mutate(misreliant = scoring_rule(misreliant_action, actual_label)) %>%
+    group_by(experiment) %>%
+    summarise(misreliant = mean(misreliant), reliance_level = mean(reliance_level))
+  behavioral_results = behavioral_result %>%
+    left_join(misreliant, by = c("experiment")) %>%
+    rbind(behavioral_results)
+}
+behavioral_results
+```
+```{r sort results}
+results = rational_results %>% 
+  group_by(experiment) %>% 
+  summarise(benchmark = mean(benchmark), baseline = mean(baseline))
+results = results %>% 
+  left_join(behavioral_results %>% 
+              group_by(experiment) %>% 
+              summarise(behavioral = mean(behavioral), 
+                        misreliant = mean(misreliant)))
+results = results %>% 
+  mutate(belief_loss = (misreliant - behavioral)/(benchmark - baseline), 
+         reliance_loss = (benchmark - misreliant)/(benchmark - baseline)) %>%
+  arrange(reliance_loss)
+results
+```
+
+
+```{r visualization}
+colors <- c("Baseline" = "#a6d854", "Baseline(human alone)" = "#e78ac3", "Benchmark" = "#1F2041", "Behavioral" = "#fc8d62", "Misreliant" = "#8da0cb")
+ggplot() +
+  stat_slabinterval(data = behavioral_results, aes(y = experiment, x = behavioral, fill = "Behavioral"), alpha = .8, color = "#202020", size = 3) +
+  stat_slabinterval(data = behavioral_results, aes(y = experiment, x = misreliant, fill = "Misreliant"), alpha = .8, color = "#202020", size = 3) +
+  stat_slabinterval(data = rational_results, aes(y = experiment, x = baseline, fill = "Baseline"), alpha = .8, color = "#202020", size = 3) +
+  stat_slabinterval(data = rational_results, aes(y = experiment, x = baseline2, fill = "Baseline(human alone)"), alpha = .8, color = "#202020", size = 3) +
+  stat_slabinterval(data = rational_results, aes(y = experiment, x = benchmark, fill = "Benchmark"), alpha = .8, color = "#202020", size = 3) +
+  labs(x = "", y = "", color = "Quantiy") +
+  ylim((results)$experiment) +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major = element_line(colour = "grey"),
+        axis.line.x = element_line(linewidth = 1.5, colour = "grey80"),
+        panel.background = element_rect(fill = "white", color = "white"),
+        axis.ticks.y = element_blank(),
+        axis.ticks.x = element_line(colour = "grey")) + 
+  scale_fill_manual(values = colors)
+# ggsave("./lai_results.pdf", unit = "in", width = 7.22222222222, height = 3.47222222222 * 5/4)
+```
+
+```{r reliance plot}
+quantile_data = rational_data %>%
+  group_by(review_text) %>%
+  summarise(EAIhuman = mean(pos_ai_payoff - pos_human_payoff)) %>%
+  arrange(desc(EAIhuman)) %>%
+  mutate(sortId = row_number())
+quantile_data = quantile_data %>%
+  mutate(quantile = sortId / nrow(quantile_data)) %>%
+  mutate(group_row = "Quantile") %>%
+  mutate(cum_EAIhuman = cumsum(EAIhuman))
+reliance_data = behavioral_data %>% 
+  group_by(review_num, experiment) %>% 
+  mutate(p_id = row_number()) %>%
+  group_by(experiment, p_id) %>%
+  summarise(reliance = mean((user_label == predicted_label) & (human_pred != user_label))) %>%
+  mutate(group_row = "Reliance")
+
+
+p1 = quantile_data %>%
+  ggplot() +
+  geom_line(aes(x = quantile, y = EAIhuman)) +
+  geom_hline(yintercept = 0) +
+  labs(x = "Sorted signals", y = "", color = '') +
+  xlim(0, 1) +
+  theme_light() +
+  scale_color_discrete(labels=c('No explanation', 'Examples', 'Heatmap', 'Random heatmap', 'Accuracy'))
+# p3 = quantile_data %>%
+#   ggplot() +
+#   geom_line(aes(x = quantile, y = cum_EAIhuman)) +
+#   labs(x = "Sorted signals", y = "", color = '') +
+#   xlim(0, 1) +
+#   theme_light() +
+#   scale_color_discrete(labels=c('No explanation', 'Examples', 'Heatmap', 'Random heatmap', 'Accuracy'))
+p2 = reliance_data %>%
+  ggplot() +
+  stat_pointinterval(aes(x = reliance, y = experiment, color = experiment), point_size = 2) +
+  xlim(0, 1) +
+  theme_light() +
+  theme(legend.position = "none") +
+  scale_y_discrete(limits=c("machine_with_accuracy","machine_and_heatmap", "machine_and_random_heatmap", "machine_and_examples", "machine"), 
+                   labels = c(-0.5,0.0,0.5,0.5,0.5)) +
+  labs(x = "Sorted signals", y = "", color = '')
+plot_grid(p1, p2, cols = 1)
+ggsave("./lai_reliance.pdf", unit = "in", width = 7.22222222222 * 0.9, height = 3.47222222222 * 1.8)
+```
+
+
+# Using discretized signals to approximate
+
+```{r discretized signals}
+rational_action = human_predictions %>% 
+  group_by(user_label, predicted_label, cluster) %>%
+  mutate(pos_human_payoff = scoring_rule(user_label, actual_label),
+         pos_ai_payoff = scoring_rule(predicted_label, actual_label)) %>%
+  summarise(pos_human_payoff = mean(pos_human_payoff),
+            pos_ai_payoff = mean(pos_ai_payoff))
+rational_data = human_predictions %>% 
+  ungroup() %>%
+  mutate(prior_human_payoff = mean(scoring_rule(user_label, actual_label)),
+         prior_ai_payoff = mean(scoring_rule(predicted_label, actual_label))) %>%
+  mutate(baseline_action = ifelse(prior_human_payoff > prior_ai_payoff, user_label, predicted_label)) %>%
+  mutate(baseline = scoring_rule(baseline_action, actual_label)) %>%
+  mutate(baseline2_action = ifelse(prior_human_payoff <= prior_ai_payoff, user_label, predicted_label)) %>%
+  mutate(baseline2 = scoring_rule(baseline2_action, actual_label)) %>%
+  left_join(rational_action) %>%
+  mutate(benchmark_action = ifelse(pos_human_payoff > pos_ai_payoff, user_label, predicted_label)) %>%
+  mutate(benchmark = scoring_rule(benchmark_action, actual_label)) %>%
+  mutate(rational_reliance_level = (benchmark_action == predicted_label) & (user_label != predicted_label))
+sample_size = 40
+n_round = 1000
+rational_results = data.frame()
+for (i in 1:n_round) {
+  rational_results = rational_data %>% 
+    group_by(review_num) %>%
+    sample_n(sample_size) %>%
+    ungroup() %>%
+    summarise(baseline = mean(baseline), 
+              baseline2 = mean(baseline2), 
+              benchmark = mean(benchmark),
+              rational_reliance = mean(rational_reliance_level)) %>%
+    rbind(rational_results)
+}
+rational_results = rational_results %>%
+  cross_join(exp_data %>% group_by(experiment) %>% summarise())
+
+behavioral_data = exp_data %>%
+  mutate(behavioral = scoring_rule(user_label, actual_label))
+
+sample_size = 40
+n_round = 1000
+behavioral_results = data.frame()
+for (i in 1:n_round) {
+  behavioral_result = behavioral_data %>% 
+    group_by(review_num, experiment) %>%
+    sample_n(sample_size) %>%
+    group_by(experiment) %>%
+    summarise(behavioral = mean(behavioral))
+  reliance_level = behavioral_data %>% 
+    group_by(review_num, experiment) %>%
+    sample_n(sample_size) %>%
+    mutate(sample_id = row_number()) %>%
+    group_by(experiment, sample_id) %>%
+    summarise(reliance_level = mean((user_label == predicted_label) & (human_pred != user_label))) %>%
+    group_by(experiment) %>%
+    summarise(reliance_level = mean(reliance_level))
+  misreliant = rational_data %>% 
+    group_by(review_num) %>%
+    sample_n(sample_size) %>%
+    mutate(sample_id = row_number()) %>%
+    select(-experiment) %>%
+    cross_join(reliance_level) %>%
+    group_by(sample_id, experiment) %>%
+    arrange(desc(pos_ai_payoff - pos_human_payoff), .by_group = TRUE) %>%
+    mutate(sort_id = row_number()) %>%
+    mutate(max_sort_id = max(sort_id)) %>%
+    mutate(misreliant_action = ifelse(sort_id <= reliance_level * max_sort_id,
+                                      predicted_label, 
+                                      user_label)) %>%
+    mutate(misreliant = scoring_rule(misreliant_action, actual_label)) %>%
+    group_by(experiment) %>%
+    summarise(misreliant = mean(misreliant), reliance_level = mean(reliance_level))
+  behavioral_results = behavioral_result %>%
+    left_join(misreliant, by = c("experiment")) %>%
+    rbind(behavioral_results)
+}
+results = rational_results %>% 
+  group_by(experiment) %>% 
+  summarise(benchmark = mean(benchmark), baseline = mean(baseline))
+results = results %>% 
+  left_join(behavioral_results %>% 
+              group_by(experiment) %>% 
+              summarise(behavioral = mean(behavioral), 
+                        misreliant = mean(misreliant)))
+results = results %>% 
+  mutate(belief_loss = (misreliant - behavioral)/(benchmark - baseline), 
+         reliance_loss = (benchmark - misreliant)/(benchmark - baseline)) %>%
+  arrange(reliance_loss)
+ggplot() +
+  stat_slabinterval(data = behavioral_results, aes(y = experiment, x = behavioral, fill = "Behavioral"), alpha = .8, color = "#202020", size = 3) +
+  stat_slabinterval(data = behavioral_results, aes(y = experiment, x = misreliant, fill = "Misreliant"), alpha = .8, color = "#202020", size = 3) +
+  stat_slabinterval(data = rational_results, aes(y = experiment, x = baseline, fill = "Baseline"), alpha = .8, color = "#202020", size = 3) +
+  stat_slabinterval(data = rational_results, aes(y = experiment, x = baseline2, fill = "Baseline(human alone)"), alpha = .8, color = "#202020", size = 3) +
+  stat_slabinterval(data = rational_results, aes(y = experiment, x = benchmark, fill = "Benchmark"), alpha = .8, color = "#202020", size = 3) +
+  labs(x = "", y = "", color = "Quantiy") +
+  ylim((results)$experiment) +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major = element_line(colour = "grey"),
+        axis.line.x = element_line(linewidth = 1.5, colour = "grey80"),
+        panel.background = element_rect(fill = "white", color = "white"),
+        axis.ticks.y = element_blank(),
+        axis.ticks.x = element_line(colour = "grey")) + 
+  scale_fill_manual(values = colors)
+# ggsave("./lai_results_test_performance.pdf", unit = "in", width = 7.22222222222, height = 3.47222222222 * 5/4)
+```
+
+
